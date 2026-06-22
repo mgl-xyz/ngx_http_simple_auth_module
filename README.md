@@ -87,23 +87,57 @@ make install NGINX_SRC=/path/to/nginx-1.26.x NGINX_PREFIX=/usr/local/nginx
 
 | 指令 | 作用域 | 说明 |
 |------|--------|------|
-| `auth_enable on \| off` | location | 是否启用凭证处理，默认 `off` |
-| `auth_backend <地址>` | location | 转发目标；可写 `http://127.0.0.1:8080` 或 upstream 名 `business_server_group`（无 scheme 时自动补 `http://`） |
+| `auth_enable on \| off` | location | 是否启用凭证处理；配置 `auth_backend` 时自动视为 `on`，默认 `off` |
+| `auth_backend <URL>` | location | 鉴权接口地址；模块向其发 GET 请求，**仅 HTTP 200 放行** |
+
+### 鉴权流程
+
+1. 无凭证 → 401 JSON，不访问后端  
+2. 有凭证 → 模块向 `auth_backend` 发鉴权请求（带 `Authorization` + `X-Original-URI`）  
+3. **仅返回 200** → 继续执行 location 内后续配置（`root` / `proxy_pass` 等）  
+4. 401/403/404/5xx、连接失败、超时等 **一律拒绝**，不会访问后面内容
+
+### 后端鉴权接口约定
+
+```
+GET {auth_backend路径}
+Authorization: Bearer {token}
+X-Original-URI: {客户端原始URI}
+```
+
+- 凭证有效 → 返回 **200**（body 可空）  
+- 凭证无效 → 返回 401/403 等（客户端收到 403 JSON）  
+- 服务不可用 → 客户端收到 502 JSON
+
+```nginx
+location / {
+    auth_enable on;
+    auth_backend http://127.0.0.1:8080/auth/check;
+
+    root html;              # 鉴权 200 后才生效
+    index index.html;
+}
+```
 | `token_param_key <参数名>` | location | URL 凭证参数名，默认 `token` |
 
 完整示例见 [examples/nginx.conf](examples/nginx.conf)。
 
 ```nginx
-upstream business_server_group {
-    server 127.0.0.1:8080;
+location / {
+    auth_enable on;
+    auth_backend http://127.0.0.1:8080/auth/check;
+    root html;
 }
+```
 
+也可鉴权通过后 `proxy_pass` 到资源服务：
+
+```nginx
 location /res/ {
     auth_enable on;
-    token_param_key access_token;
-    auth_backend business_server_group;
+    auth_backend http://127.0.0.1:8080/auth/check;
 
-    proxy_pass $target_backend;
+    proxy_pass http://127.0.0.1:9000;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -119,14 +153,16 @@ location /res/ {
    无标准 Bearer 头时，从 Query 中读取 `token_param_key` 指定参数，自动生成 `Authorization: Bearer {token}` 头。
 
 3. **无凭证拦截**  
-   Header 与 URL 均无有效凭证时，Nginx 直接返回：
+   Header 与 URL 均无有效凭证时，Nginx 直接返回 401 JSON。
 
-   ```json
-   {"code":401,"msg":"缺少访问凭证，需携带Authorization请求头或url token参数"}
-   ```
+4. **鉴权网关**  
+   有凭证时向 `auth_backend` 发起鉴权，**只认 HTTP 200**；其余任何情况（含网络错误）均拒绝。
 
-4. **请求方法**  
-   不对任何 HTTP 方法做过滤，读写权限由业务后端控制。
+5. **请求方法**  
+   不对客户端 HTTP 方法做过滤；鉴权请求固定为 GET。
+
+6. **后续处理**  
+   鉴权 200 后，由 location 内用户自行配置的 `root` / `proxy_pass` 等继续处理。
 
 ## 典型访问场景
 

@@ -2,9 +2,8 @@
 /*
  * Copyright (C) ngx_http_simple_auth_module contributors
  *
- * Nginx HTTP module: credential normalization gateway for object storage proxy.
- * Converts URL token query params to Authorization: Bearer headers; does not
- * validate tokens — all auth logic is delegated to the business backend.
+ * Gateway credential normalization + backend auth verification.
+ * Only HTTP 200 from auth_backend allows the request to continue.
  */
 
 #include <ngx_config.h>
@@ -20,7 +19,18 @@ typedef struct {
     ngx_flag_t  auth_enable;
     ngx_str_t   auth_backend;
     ngx_str_t   token_param_key;
+    ngx_str_t   upstream_schema;
+    ngx_str_t   auth_uri;
+    ngx_url_t   upstream_url;
 } ngx_http_simple_auth_loc_conf_t;
+
+
+typedef struct {
+    ngx_uint_t            done;
+    ngx_uint_t            status;
+    ngx_http_request_t   *request;
+    ngx_http_request_t   *subrequest;
+} ngx_http_simple_auth_ctx_t;
 
 
 static ngx_int_t ngx_http_simple_auth_handler(ngx_http_request_t *r);
@@ -34,13 +44,32 @@ static char *ngx_http_simple_auth_merge_loc_conf(ngx_conf_t *cf, void *parent,
 static char *ngx_http_simple_auth_check_loc_conf(ngx_conf_t *cf, void *conf);
 static char *ngx_http_simple_auth_auth_backend(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_simple_auth_parse_backend(ngx_conf_t *cf,
+    ngx_http_simple_auth_loc_conf_t *slcf);
 
 static ngx_int_t ngx_http_simple_auth_has_bearer(ngx_http_request_t *r);
 static ngx_int_t ngx_http_simple_auth_get_arg(ngx_http_request_t *r,
     ngx_str_t *name, ngx_str_t *value);
 static ngx_int_t ngx_http_simple_auth_set_bearer(ngx_http_request_t *r,
     ngx_str_t *token);
+static ngx_int_t ngx_http_simple_auth_reply(ngx_http_request_t *r,
+    ngx_uint_t status, u_char *body, size_t body_len);
 static ngx_int_t ngx_http_simple_auth_unauthorized(ngx_http_request_t *r);
+static ngx_int_t ngx_http_simple_auth_forbidden(ngx_http_request_t *r);
+static ngx_int_t ngx_http_simple_auth_bad_gateway(ngx_http_request_t *r);
+
+static ngx_int_t ngx_http_simple_auth_start_verify(ngx_http_request_t *r,
+    ngx_http_simple_auth_ctx_t *ctx);
+static ngx_int_t ngx_http_simple_auth_verify_done(ngx_http_request_t *r,
+    void *data, ngx_int_t rc);
+static ngx_int_t ngx_http_simple_auth_verify_handler(ngx_http_request_t *r);
+static void ngx_http_simple_auth_verify_input_body(ngx_http_request_t *r);
+static void ngx_http_simple_auth_verify_upstream(ngx_http_request_t *r);
+static void ngx_http_simple_auth_verify_abort(ngx_http_request_t *r, ngx_int_t rc);
+static ngx_int_t ngx_http_simple_auth_verify_create_request(ngx_http_request_t *r);
+static ngx_int_t ngx_http_simple_auth_verify_process_header(ngx_http_request_t *r);
+static ngx_int_t ngx_http_simple_auth_verify_finalize(ngx_http_request_t *r,
+    ngx_uint_t status);
 
 
 static ngx_command_t ngx_http_simple_auth_commands[] = {
@@ -71,32 +100,29 @@ static ngx_command_t ngx_http_simple_auth_commands[] = {
 
 
 static ngx_http_module_t ngx_http_simple_auth_module_ctx = {
-    ngx_http_simple_auth_preconf,          /* preconfiguration */
-    ngx_http_simple_auth_init,             /* postconfiguration */
-
-    NULL,                                  /* create main configuration */
-    NULL,                                  /* init main configuration */
-
-    NULL,                                  /* create server configuration */
-    NULL,                                  /* init server configuration */
-
-    ngx_http_simple_auth_create_loc_conf,  /* create location configuration */
-    ngx_http_simple_auth_merge_loc_conf    /* merge location configuration */
+    ngx_http_simple_auth_preconf,
+    ngx_http_simple_auth_init,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    ngx_http_simple_auth_create_loc_conf,
+    ngx_http_simple_auth_merge_loc_conf
 };
 
 
 ngx_module_t ngx_http_simple_auth_module = {
     NGX_MODULE_V1,
-    &ngx_http_simple_auth_module_ctx,      /* module context */
-    ngx_http_simple_auth_commands,         /* module directives */
-    NGX_HTTP_MODULE,                       /* module type */
-    NULL,                                  /* init master */
-    NULL,                                  /* init module */
-    NULL,                                  /* init process */
-    NULL,                                  /* init thread */
-    NULL,                                  /* exit thread */
-    NULL,                                  /* exit process */
-    NULL,                                  /* exit master */
+    &ngx_http_simple_auth_module_ctx,
+    ngx_http_simple_auth_commands,
+    NGX_HTTP_MODULE,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
     NGX_MODULE_V1_PADDING
 };
 
@@ -175,6 +201,12 @@ ngx_http_simple_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_str_value(conf->auth_backend, prev->auth_backend, "");
     ngx_conf_merge_str_value(conf->token_param_key, prev->token_param_key, "token");
 
+    if (conf->auth_backend.len > 0) {
+        if (ngx_http_simple_auth_parse_backend(cf, conf) != NGX_CONF_OK) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
     return ngx_http_simple_auth_check_loc_conf(cf, conf);
 }
 
@@ -196,19 +228,81 @@ ngx_http_simple_auth_auth_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf
         || ngx_strncmp(backend->data, (u_char *) "https://", 8) == 0)
     {
         slcf->auth_backend = *backend;
-        return NGX_CONF_OK;
+    } else {
+        slcf->auth_backend.len = backend->len + sizeof("http://") - 1;
+        slcf->auth_backend.data = ngx_pnalloc(cf->pool, slcf->auth_backend.len);
+        if (slcf->auth_backend.data == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        ngx_memcpy(slcf->auth_backend.data, (u_char *) "http://",
+                   sizeof("http://") - 1);
+        ngx_memcpy(slcf->auth_backend.data + sizeof("http://") - 1,
+                   backend->data, backend->len);
     }
 
-    slcf->auth_backend.len = backend->len + sizeof("http://") - 1;
-    slcf->auth_backend.data = ngx_pnalloc(cf->pool, slcf->auth_backend.len);
-    if (slcf->auth_backend.data == NULL) {
+    slcf->auth_enable = 1;
+
+    if (ngx_http_simple_auth_parse_backend(cf, slcf) != NGX_CONF_OK) {
         return NGX_CONF_ERROR;
     }
 
-    ngx_memcpy(slcf->auth_backend.data, (u_char *) "http://",
-               sizeof("http://") - 1);
-    ngx_memcpy(slcf->auth_backend.data + sizeof("http://") - 1,
-               backend->data, backend->len);
+    return ngx_http_simple_auth_check_loc_conf(cf, slcf);
+}
+
+
+static char *
+ngx_http_simple_auth_parse_backend(ngx_conf_t *cf,
+    ngx_http_simple_auth_loc_conf_t *slcf)
+{
+    ngx_str_t  url, uri;
+    u_char    *p, *last;
+
+    url = slcf->auth_backend;
+
+    if (url.len > 7 && ngx_strncasecmp(url.data, (u_char *) "http://", 7) == 0) {
+        ngx_str_set(&slcf->upstream_schema, "http");
+        url.len -= 7;
+        url.data += 7;
+    } else if (url.len > 8
+               && ngx_strncasecmp(url.data, (u_char *) "https://", 8) == 0)
+    {
+        ngx_str_set(&slcf->upstream_schema, "https");
+        url.len -= 8;
+        url.data += 8;
+    } else {
+        return "invalid auth_backend scheme";
+    }
+
+    last = url.data + url.len;
+    p = ngx_strlchr(url.data, last, '/');
+
+    if (p != NULL) {
+        uri.data = p;
+        uri.len = last - p;
+        if (uri.len == 0) {
+            ngx_str_set(&uri, "/");
+        }
+        url.len = p - url.data;
+    } else {
+        ngx_str_set(&uri, "/");
+    }
+
+    slcf->auth_uri = uri;
+
+    ngx_memzero(&slcf->upstream_url, sizeof(ngx_url_t));
+    slcf->upstream_url.url = url;
+    slcf->upstream_url.default_port = (slcf->upstream_schema.len == 5) ? 443 : 80;
+    slcf->upstream_url.uri_part = 0;
+
+    if (ngx_parse_url(cf->pool, &slcf->upstream_url) != NGX_OK) {
+        if (slcf->upstream_url.err) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "%s in auth_backend \"%V\"",
+                               slcf->upstream_url.err, &slcf->auth_backend);
+        }
+        return NGX_CONF_ERROR;
+    }
 
     return NGX_CONF_OK;
 }
@@ -219,8 +313,20 @@ ngx_http_simple_auth_check_loc_conf(ngx_conf_t *cf, void *conf)
 {
     ngx_http_simple_auth_loc_conf_t  *slcf = conf;
 
-    if (slcf->auth_enable && slcf->auth_backend.len == 0) {
+    if (slcf->auth_backend.len > 0) {
+        slcf->auth_enable = 1;
+    }
+
+    if (!slcf->auth_enable) {
+        return NGX_CONF_OK;
+    }
+
+    if (slcf->auth_backend.len == 0) {
         return "auth_enable is on but \"auth_backend\" is not configured";
+    }
+
+    if (slcf->upstream_url.addrs == NULL) {
+        return "invalid auth_backend address";
     }
 
     return NGX_CONF_OK;
@@ -388,22 +494,20 @@ ngx_http_simple_auth_set_bearer(ngx_http_request_t *r, ngx_str_t *token)
 
 
 static ngx_int_t
-ngx_http_simple_auth_unauthorized(ngx_http_request_t *r)
+ngx_http_simple_auth_reply(ngx_http_request_t *r, ngx_uint_t status,
+    u_char *body, size_t body_len)
 {
     ngx_int_t    rc;
     ngx_buf_t   *b;
     ngx_chain_t  out;
 
-    static u_char body[] =
-        "{\"code\":401,\"msg\":\"缺少访问凭证，需携带Authorization请求头或url token参数\"}";
-
     if (ngx_http_discard_request_body(r) != NGX_OK) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    r->headers_out.status = NGX_HTTP_UNAUTHORIZED;
+    r->headers_out.status = status;
     ngx_str_set(&r->headers_out.content_type, "application/json; charset=utf-8");
-    r->headers_out.content_length_n = sizeof(body) - 1;
+    r->headers_out.content_length_n = body_len;
 
     rc = ngx_http_send_header(r);
     if (rc == NGX_ERROR || rc > NGX_OK) {
@@ -416,7 +520,7 @@ ngx_http_simple_auth_unauthorized(ngx_http_request_t *r)
     }
 
     b->pos = body;
-    b->last = body + sizeof(body) - 1;
+    b->last = body + body_len;
     b->memory = 1;
     b->last_buf = 1;
 
@@ -428,8 +532,323 @@ ngx_http_simple_auth_unauthorized(ngx_http_request_t *r)
         return rc;
     }
 
-    ngx_http_finalize_request(r, NGX_HTTP_UNAUTHORIZED);
-    return NGX_HTTP_UNAUTHORIZED;
+    ngx_http_finalize_request(r, status);
+    return status;
+}
+
+
+static ngx_int_t
+ngx_http_simple_auth_unauthorized(ngx_http_request_t *r)
+{
+    static u_char body[] =
+        "{\"code\":401,\"msg\":\"缺少访问凭证，需携带Authorization请求头或url token参数\"}";
+
+    return ngx_http_simple_auth_reply(r, NGX_HTTP_UNAUTHORIZED, body,
+                                      sizeof(body) - 1);
+}
+
+
+static ngx_int_t
+ngx_http_simple_auth_forbidden(ngx_http_request_t *r)
+{
+    static u_char body[] =
+        "{\"code\":403,\"msg\":\"鉴权未通过，拒绝访问\"}";
+
+    return ngx_http_simple_auth_reply(r, NGX_HTTP_FORBIDDEN, body,
+                                      sizeof(body) - 1);
+}
+
+
+static ngx_int_t
+ngx_http_simple_auth_bad_gateway(ngx_http_request_t *r)
+{
+    static u_char body[] =
+        "{\"code\":502,\"msg\":\"鉴权服务不可用，拒绝访问\"}";
+
+    return ngx_http_simple_auth_reply(r, NGX_HTTP_BAD_GATEWAY, body,
+                                      sizeof(body) - 1);
+}
+
+
+static ngx_int_t
+ngx_http_simple_auth_verify_finalize(ngx_http_request_t *r, ngx_uint_t status)
+{
+    ngx_http_request_t           *pr;
+    ngx_http_simple_auth_ctx_t   *ctx;
+
+    pr = r->parent;
+    if (pr == NULL) {
+        return NGX_ERROR;
+    }
+
+    ctx = ngx_http_get_module_ctx(pr, ngx_http_simple_auth_module);
+    if (ctx == NULL) {
+        return NGX_ERROR;
+    }
+
+    ctx->done = 1;
+    ctx->status = status;
+
+    r->headers_out.status = status;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_simple_auth_verify_done(ngx_http_request_t *r, void *data,
+    ngx_int_t rc)
+{
+    ngx_http_simple_auth_ctx_t  *ctx = data;
+
+    if (ctx->status == 0) {
+        if (r->headers_out.status) {
+            ctx->status = r->headers_out.status;
+        } else {
+            ctx->status = NGX_HTTP_BAD_GATEWAY;
+        }
+        ctx->done = 1;
+    }
+
+    return rc;
+}
+
+
+static ngx_int_t
+ngx_http_simple_auth_start_verify(ngx_http_request_t *r,
+    ngx_http_simple_auth_ctx_t *ctx)
+{
+    ngx_http_request_t            *sr;
+    ngx_http_post_subrequest_t    *ps;
+    ngx_table_elt_t               *h;
+    ngx_str_t                      uri;
+
+    ps = ngx_palloc(r->pool, sizeof(ngx_http_post_subrequest_t));
+    if (ps == NULL) {
+        return NGX_ERROR;
+    }
+
+    ps->handler = ngx_http_simple_auth_verify_done;
+    ps->data = ctx;
+
+    uri = r->uri;
+
+    if (ngx_http_subrequest(r, &uri, &r->args, &sr, ps,
+                            NGX_HTTP_SUBREQUEST_WAITED)
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    if (r->headers_in.authorization) {
+        h = ngx_list_push(&sr->headers_in.headers);
+        if (h == NULL) {
+            return NGX_ERROR;
+        }
+
+        *h = *r->headers_in.authorization;
+        h->next = NULL;
+        sr->headers_in.authorization = h;
+    }
+
+    sr->content_handler = ngx_http_simple_auth_verify_handler;
+    sr->header_only = 1;
+
+    ctx->request = r;
+    ctx->subrequest = sr;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_simple_auth_verify_handler(ngx_http_request_t *r)
+{
+    ngx_int_t  rc;
+
+    rc = ngx_http_read_client_request_body(r, ngx_http_simple_auth_verify_input_body);
+    if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+        return rc;
+    }
+
+    return NGX_DONE;
+}
+
+
+static void
+ngx_http_simple_auth_verify_input_body(ngx_http_request_t *r)
+{
+    ngx_http_simple_auth_verify_upstream(r);
+}
+
+
+static void
+ngx_http_simple_auth_verify_upstream(ngx_http_request_t *r)
+{
+    ngx_http_simple_auth_loc_conf_t  *slcf;
+    ngx_http_upstream_t              *u;
+
+    if (ngx_http_upstream_create(r) != NGX_OK) {
+        ngx_http_simple_auth_verify_finalize(r, NGX_HTTP_BAD_GATEWAY);
+        ngx_http_finalize_request(r, NGX_HTTP_BAD_GATEWAY);
+        return;
+    }
+
+    slcf = ngx_http_get_module_loc_conf(r->parent, ngx_http_simple_auth_module);
+    u = r->upstream;
+
+    u->conf = ngx_http_get_module_srv_conf(r, ngx_http_upstream_module);
+
+    u->resolved = ngx_pcalloc(r->pool, sizeof(ngx_http_upstream_resolved_t));
+    if (u->resolved == NULL) {
+        ngx_http_simple_auth_verify_finalize(r, NGX_HTTP_BAD_GATEWAY);
+        ngx_http_finalize_request(r, NGX_HTTP_BAD_GATEWAY);
+        return;
+    }
+
+    u->resolved->host = slcf->upstream_url.host;
+    u->resolved->port = slcf->upstream_url.port;
+    u->resolved->no_port = slcf->upstream_url.no_port;
+    u->resolved->naddrs = slcf->upstream_url.naddrs;
+    u->resolved->addrs = slcf->upstream_url.addrs;
+    u->resolved->sockaddr = slcf->upstream_url.sockaddr;
+    u->resolved->socklen = slcf->upstream_url.socklen;
+    u->resolved->name = slcf->upstream_url.host;
+
+    u->schema = slcf->upstream_schema;
+
+#if (NGX_HTTP_SSL)
+    if (slcf->upstream_schema.len == 5) {
+        u->ssl = 1;
+    }
+#endif
+
+    u->create_request = ngx_http_simple_auth_verify_create_request;
+    u->process_header = ngx_http_simple_auth_verify_process_header;
+    u->finalize_request = ngx_http_simple_auth_verify_abort;
+    u->input_filter_init = ngx_http_upstream_non_buffered_filter_init;
+    u->input_filter = ngx_http_upstream_non_buffered_filter;
+    u->input_filter_ctx = r;
+    u->header_only = 1;
+
+    ngx_http_upstream_init(r);
+}
+
+
+static void
+ngx_http_simple_auth_verify_abort(ngx_http_request_t *r, ngx_int_t rc)
+{
+    if (rc == NGX_HTTP_CLIENT_CLOSED_REQUEST) {
+        ngx_http_simple_auth_verify_finalize(r, NGX_HTTP_BAD_GATEWAY);
+        return;
+    }
+
+    ngx_http_simple_auth_verify_finalize(r, NGX_HTTP_BAD_GATEWAY);
+}
+
+
+static ngx_int_t
+ngx_http_simple_auth_verify_create_request(ngx_http_request_t *r)
+{
+    size_t                            len;
+    ngx_buf_t                        *b;
+    ngx_chain_t                      *cl;
+    ngx_http_request_t               *pr;
+    ngx_http_simple_auth_loc_conf_t  *slcf;
+    ngx_http_upstream_t              *u;
+
+    pr = r->parent;
+    slcf = ngx_http_get_module_loc_conf(pr, ngx_http_simple_auth_module);
+    u = r->upstream;
+
+    len = sizeof("GET ") - 1 + slcf->auth_uri.len
+          + sizeof(" HTTP/1.1\r\n") - 1
+          + sizeof("Host: \r\n") - 1 + slcf->upstream_url.host.len
+          + sizeof("X-Original-URI: \r\n") - 1 + pr->uri.len
+          + sizeof("Connection: close\r\n\r\n") - 1;
+
+    if (pr->headers_in.authorization) {
+        len += sizeof("Authorization: \r\n") - 1
+               + pr->headers_in.authorization->value.len;
+    }
+
+    b = ngx_create_temp_buf(r->pool, len);
+    if (b == NULL) {
+        return NGX_ERROR;
+    }
+
+    cl = ngx_alloc_chain_link(r->pool);
+    if (cl == NULL) {
+        return NGX_ERROR;
+    }
+
+    cl->buf = b;
+    cl->next = NULL;
+
+    b->last = ngx_cpymem(b->last, (u_char *) "GET ", sizeof("GET ") - 1);
+    b->last = ngx_copy(b->last, slcf->auth_uri.data, slcf->auth_uri.len);
+    b->last = ngx_cpymem(b->last, (u_char *) " HTTP/1.1\r\n",
+                         sizeof(" HTTP/1.1\r\n") - 1);
+
+    b->last = ngx_cpymem(b->last, (u_char *) "Host: ", sizeof("Host: ") - 1);
+    b->last = ngx_copy(b->last, slcf->upstream_url.host.data,
+                       slcf->upstream_url.host.len);
+    *b->last++ = '\r'; *b->last++ = '\n';
+
+    if (pr->headers_in.authorization) {
+        b->last = ngx_cpymem(b->last, (u_char *) "Authorization: ",
+                             sizeof("Authorization: ") - 1);
+        b->last = ngx_copy(b->last, pr->headers_in.authorization->value.data,
+                           pr->headers_in.authorization->value.len);
+        *b->last++ = '\r'; *b->last++ = '\n';
+    }
+
+    b->last = ngx_cpymem(b->last, (u_char *) "X-Original-URI: ",
+                         sizeof("X-Original-URI: ") - 1);
+    b->last = ngx_copy(b->last, pr->uri.data, pr->uri.len);
+    *b->last++ = '\r'; *b->last++ = '\n';
+
+    b->last = ngx_cpymem(b->last, (u_char *) "Connection: close\r\n\r\n",
+                         sizeof("Connection: close\r\n\r\n") - 1);
+
+    u->request_bufs = cl;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_simple_auth_verify_process_header(ngx_http_request_t *r)
+{
+    ngx_int_t            rc;
+    ngx_http_upstream_t  *u;
+
+    u = r->upstream;
+
+    for ( ;; ) {
+        rc = ngx_http_parse_header_line(r, &u->buffer, 1);
+
+        if (rc == NGX_OK) {
+            rc = ngx_http_upstream_process_header(r, u);
+            if (rc != NGX_OK) {
+                return rc;
+            }
+
+            continue;
+        }
+
+        if (rc == NGX_HTTP_PARSE_HEADER_DONE) {
+            ngx_http_simple_auth_verify_finalize(r, u->headers_in.status_n);
+            return NGX_OK;
+        }
+
+        if (rc == NGX_AGAIN) {
+            return NGX_AGAIN;
+        }
+
+        ngx_http_simple_auth_verify_finalize(r, NGX_HTTP_BAD_GATEWAY);
+        return NGX_HTTP_UPSTREAM_INVALID_HEADER;
+    }
 }
 
 
@@ -438,7 +857,12 @@ ngx_http_simple_auth_handler(ngx_http_request_t *r)
 {
     ngx_int_t                         rc;
     ngx_str_t                         token;
+    ngx_http_simple_auth_ctx_t       *ctx;
     ngx_http_simple_auth_loc_conf_t  *slcf;
+
+    if (r != r->main) {
+        return NGX_DECLINED;
+    }
 
     slcf = ngx_http_get_module_loc_conf(r, ngx_http_simple_auth_module);
 
@@ -446,21 +870,59 @@ ngx_http_simple_auth_handler(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "simple auth handler");
+    ctx = ngx_http_get_module_ctx(r, ngx_http_simple_auth_module);
 
-    if (ngx_http_simple_auth_has_bearer(r)) {
-        return NGX_DECLINED;
-    }
-
-    rc = ngx_http_simple_auth_get_arg(r, &slcf->token_param_key, &token);
-    if (rc == NGX_OK) {
-        if (ngx_http_simple_auth_set_bearer(r, &token) != NGX_OK) {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    if (ctx != NULL) {
+        if (!ctx->done) {
+            return NGX_AGAIN;
         }
 
-        return NGX_DECLINED;
+        if (ctx->status == NGX_HTTP_OK) {
+            return NGX_DECLINED;
+        }
+
+        if (ctx->status == NGX_HTTP_UNAUTHORIZED) {
+            return ngx_http_simple_auth_unauthorized(r);
+        }
+
+        if (ctx->status == NGX_HTTP_FORBIDDEN) {
+            return ngx_http_simple_auth_forbidden(r);
+        }
+
+        if (ctx->status >= NGX_HTTP_BAD_REQUEST
+            && ctx->status < NGX_HTTP_INTERNAL_SERVER_ERROR)
+        {
+            return ngx_http_simple_auth_forbidden(r);
+        }
+
+        return ngx_http_simple_auth_bad_gateway(r);
     }
 
-    return ngx_http_simple_auth_unauthorized(r);
+    if (ngx_http_simple_auth_has_bearer(r)) {
+        /* fall through */
+    } else {
+        rc = ngx_http_simple_auth_get_arg(r, &slcf->token_param_key, &token);
+        if (rc == NGX_OK) {
+            if (ngx_http_simple_auth_set_bearer(r, &token) != NGX_OK) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+        } else if (rc == NGX_ERROR) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        } else {
+            return ngx_http_simple_auth_unauthorized(r);
+        }
+    }
+
+    ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_simple_auth_ctx_t));
+    if (ctx == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    ngx_http_set_ctx(r, ctx, ngx_http_simple_auth_module);
+
+    if (ngx_http_simple_auth_start_verify(r, ctx) != NGX_OK) {
+        return ngx_http_simple_auth_bad_gateway(r);
+    }
+
+    return NGX_AGAIN;
 }
