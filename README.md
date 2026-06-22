@@ -13,7 +13,7 @@ Nginx 原生 C 动态模块：对象存储网关层凭证标准化代理。将 U
 - 无凭证时网关直接返回 401 JSON，不进入业务后端
 - 不限制 HTTP 方法（GET/POST/PUT/DELETE 等全部透传）
 - 不校验 token 真伪与权限，鉴权逻辑完全由业务后端负责
-- 支持直连地址与 upstream 负载均衡两种 `proxy_backend` 写法
+- 支持直连地址与 upstream 负载均衡两种 `auth_backend` 写法
 - 导出 `$target_backend` 变量供 `proxy_pass` 使用
 
 ## CI 验证
@@ -87,9 +87,9 @@ make install NGINX_SRC=/path/to/nginx-1.26.x NGINX_PREFIX=/usr/local/nginx
 
 | 指令 | 作用域 | 说明 |
 |------|--------|------|
-| `auth_check on \| off` | location | 是否启用凭证处理，默认 `off` |
-| `proxy_backend <地址>` | location | 转发目标；可写 `http://127.0.0.1:8080` 或 upstream 名 `business_server_group`（无 scheme 时自动补 `http://`） |
-| `token_arg_name <参数名>` | location | URL 凭证参数名，默认 `token` |
+| `auth_enable on \| off` | location | 是否启用凭证处理，默认 `off` |
+| `auth_backend <地址>` | location | 转发目标；可写 `http://127.0.0.1:8080` 或 upstream 名 `business_server_group`（无 scheme 时自动补 `http://`） |
+| `token_param_key <参数名>` | location | URL 凭证参数名，默认 `token` |
 
 完整示例见 [examples/nginx.conf](examples/nginx.conf)。
 
@@ -99,9 +99,9 @@ upstream business_server_group {
 }
 
 location /res/ {
-    auth_check on;
-    token_arg_name access_token;
-    proxy_backend business_server_group;
+    auth_enable on;
+    token_param_key access_token;
+    auth_backend business_server_group;
 
     proxy_pass $target_backend;
     proxy_set_header Host $host;
@@ -116,7 +116,7 @@ location /res/ {
    请求已携带 `Authorization: Bearer {token}` 时，原样透传，忽略 URL 中的 token 参数。
 
 2. **URL 参数模式**  
-   无标准 Bearer 头时，从 Query 中读取 `token_arg_name` 指定参数，自动生成 `Authorization: Bearer {token}` 头。
+   无标准 Bearer 头时，从 Query 中读取 `token_param_key` 指定参数，自动生成 `Authorization: Bearer {token}` 头。
 
 3. **无凭证拦截**  
    Header 与 URL 均无有效凭证时，Nginx 直接返回：
@@ -134,7 +134,7 @@ location /res/ {
 |------|------|----------|
 | Ajax 接口 | `Authorization: Bearer eyJ...` | 透传 Header，转发后端 |
 | 媒体标签 | `/res/demo.mp3?token=eyJ...` | 提取 token，补充 Bearer 头 |
-| 自定义参数名 | `/res/a.jpg?access_token=eyJ...` | 按 `token_arg_name` 识别 |
+| 自定义参数名 | `/res/a.jpg?access_token=eyJ...` | 按 `token_param_key` 识别 |
 | 无凭证 | 无 Header、无参数 | 401 JSON，不转发 |
 
 ## 架构说明

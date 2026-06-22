@@ -17,9 +17,9 @@
 
 
 typedef struct {
-    ngx_flag_t  auth_check;
-    ngx_str_t   proxy_backend;
-    ngx_str_t   token_arg_name;
+    ngx_flag_t  auth_enable;
+    ngx_str_t   auth_backend;
+    ngx_str_t   token_param_key;
 } ngx_http_simple_auth_loc_conf_t;
 
 
@@ -32,7 +32,7 @@ static void *ngx_http_simple_auth_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_simple_auth_merge_loc_conf(ngx_conf_t *cf, void *parent,
     void *child);
 static char *ngx_http_simple_auth_check_loc_conf(ngx_conf_t *cf, void *conf);
-static char *ngx_http_simple_auth_proxy_backend(ngx_conf_t *cf, ngx_command_t *cmd,
+static char *ngx_http_simple_auth_auth_backend(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 
 static ngx_int_t ngx_http_simple_auth_has_bearer(ngx_http_request_t *r);
@@ -45,25 +45,25 @@ static ngx_int_t ngx_http_simple_auth_unauthorized(ngx_http_request_t *r);
 
 static ngx_command_t ngx_http_simple_auth_commands[] = {
 
-    { ngx_string("auth_check"),
+    { ngx_string("auth_enable"),
       NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_simple_auth_loc_conf_t, auth_check),
+      offsetof(ngx_http_simple_auth_loc_conf_t, auth_enable),
       NULL },
 
-    { ngx_string("proxy_backend"),
+    { ngx_string("auth_backend"),
       NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
-      ngx_http_simple_auth_proxy_backend,
+      ngx_http_simple_auth_auth_backend,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
 
-    { ngx_string("token_arg_name"),
+    { ngx_string("token_param_key"),
       NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_simple_auth_loc_conf_t, token_arg_name),
+      offsetof(ngx_http_simple_auth_loc_conf_t, token_param_key),
       NULL },
 
       ngx_null_command
@@ -159,7 +159,7 @@ ngx_http_simple_auth_create_loc_conf(ngx_conf_t *cf)
         return NULL;
     }
 
-    conf->auth_check = NGX_CONF_UNSET;
+    conf->auth_enable = NGX_CONF_UNSET;
 
     return conf;
 }
@@ -171,16 +171,16 @@ ngx_http_simple_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_simple_auth_loc_conf_t  *prev = parent;
     ngx_http_simple_auth_loc_conf_t  *conf = child;
 
-    ngx_conf_merge_value(conf->auth_check, prev->auth_check, 0);
-    ngx_conf_merge_str_value(conf->proxy_backend, prev->proxy_backend, "");
-    ngx_conf_merge_str_value(conf->token_arg_name, prev->token_arg_name, "token");
+    ngx_conf_merge_value(conf->auth_enable, prev->auth_enable, 0);
+    ngx_conf_merge_str_value(conf->auth_backend, prev->auth_backend, "");
+    ngx_conf_merge_str_value(conf->token_param_key, prev->token_param_key, "token");
 
     return ngx_http_simple_auth_check_loc_conf(cf, conf);
 }
 
 
 static char *
-ngx_http_simple_auth_proxy_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+ngx_http_simple_auth_auth_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_simple_auth_loc_conf_t  *slcf = conf;
     ngx_str_t                        *value, *backend;
@@ -189,25 +189,25 @@ ngx_http_simple_auth_proxy_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *con
     backend = &value[1];
 
     if (backend->len == 0) {
-        return "invalid proxy_backend value";
+        return "invalid auth_backend value";
     }
 
     if (ngx_strncmp(backend->data, (u_char *) "http://", 7) == 0
         || ngx_strncmp(backend->data, (u_char *) "https://", 8) == 0)
     {
-        slcf->proxy_backend = *backend;
+        slcf->auth_backend = *backend;
         return NGX_CONF_OK;
     }
 
-    slcf->proxy_backend.len = backend->len + sizeof("http://") - 1;
-    slcf->proxy_backend.data = ngx_pnalloc(cf->pool, slcf->proxy_backend.len);
-    if (slcf->proxy_backend.data == NULL) {
+    slcf->auth_backend.len = backend->len + sizeof("http://") - 1;
+    slcf->auth_backend.data = ngx_pnalloc(cf->pool, slcf->auth_backend.len);
+    if (slcf->auth_backend.data == NULL) {
         return NGX_CONF_ERROR;
     }
 
-    ngx_memcpy(slcf->proxy_backend.data, (u_char *) "http://",
+    ngx_memcpy(slcf->auth_backend.data, (u_char *) "http://",
                sizeof("http://") - 1);
-    ngx_memcpy(slcf->proxy_backend.data + sizeof("http://") - 1,
+    ngx_memcpy(slcf->auth_backend.data + sizeof("http://") - 1,
                backend->data, backend->len);
 
     return NGX_CONF_OK;
@@ -219,8 +219,8 @@ ngx_http_simple_auth_check_loc_conf(ngx_conf_t *cf, void *conf)
 {
     ngx_http_simple_auth_loc_conf_t  *slcf = conf;
 
-    if (slcf->auth_check && slcf->proxy_backend.len == 0) {
-        return "auth_check is on but \"proxy_backend\" is not configured";
+    if (slcf->auth_enable && slcf->auth_backend.len == 0) {
+        return "auth_enable is on but \"auth_backend\" is not configured";
     }
 
     return NGX_CONF_OK;
@@ -235,13 +235,13 @@ ngx_http_simple_auth_target_backend_variable(ngx_http_request_t *r,
 
     slcf = ngx_http_get_module_loc_conf(r, ngx_http_simple_auth_module);
 
-    if (slcf->proxy_backend.len == 0) {
+    if (slcf->auth_backend.len == 0) {
         v->not_found = 1;
         return NGX_OK;
     }
 
-    v->len = slcf->proxy_backend.len;
-    v->data = slcf->proxy_backend.data;
+    v->len = slcf->auth_backend.len;
+    v->data = slcf->auth_backend.data;
     v->valid = 1;
     v->no_cacheable = 1;
     v->not_found = 0;
@@ -442,7 +442,7 @@ ngx_http_simple_auth_handler(ngx_http_request_t *r)
 
     slcf = ngx_http_get_module_loc_conf(r, ngx_http_simple_auth_module);
 
-    if (!slcf->auth_check) {
+    if (!slcf->auth_enable) {
         return NGX_DECLINED;
     }
 
@@ -453,7 +453,7 @@ ngx_http_simple_auth_handler(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
-    rc = ngx_http_simple_auth_get_arg(r, &slcf->token_arg_name, &token);
+    rc = ngx_http_simple_auth_get_arg(r, &slcf->token_param_key, &token);
     if (rc == NGX_OK) {
         if (ngx_http_simple_auth_set_bearer(r, &token) != NGX_OK) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
