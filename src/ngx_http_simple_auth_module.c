@@ -33,6 +33,11 @@ typedef struct {
 } ngx_http_simple_auth_ctx_t;
 
 
+typedef struct {
+    ngx_addr_t  *addr;
+} ngx_http_simple_auth_peer_data_t;
+
+
 static ngx_int_t ngx_http_simple_auth_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_simple_auth_init(ngx_conf_t *cf);
 static ngx_int_t ngx_http_simple_auth_preconf(ngx_conf_t *cf);
@@ -66,6 +71,10 @@ static ngx_int_t ngx_http_simple_auth_verify_handler(ngx_http_request_t *r);
 static void ngx_http_simple_auth_verify_input_body(ngx_http_request_t *r);
 static void ngx_http_simple_auth_verify_upstream(ngx_http_request_t *r);
 static void ngx_http_simple_auth_verify_abort(ngx_http_request_t *r, ngx_int_t rc);
+static ngx_int_t ngx_http_simple_auth_verify_get_peer(ngx_peer_connection_t *pc,
+    void *data);
+static void ngx_http_simple_auth_verify_free_peer(ngx_peer_connection_t *pc,
+    void *data, ngx_uint_t state);
 static ngx_int_t ngx_http_simple_auth_verify_create_request(ngx_http_request_t *r);
 static ngx_int_t ngx_http_simple_auth_verify_process_header(ngx_http_request_t *r);
 static ngx_int_t ngx_http_simple_auth_verify_finalize(ngx_http_request_t *r,
@@ -685,8 +694,9 @@ ngx_http_simple_auth_verify_input_body(ngx_http_request_t *r)
 static void
 ngx_http_simple_auth_verify_upstream(ngx_http_request_t *r)
 {
-    ngx_http_simple_auth_loc_conf_t  *slcf;
-    ngx_http_upstream_t              *u;
+    ngx_http_simple_auth_loc_conf_t   *slcf;
+    ngx_http_simple_auth_peer_data_t  *pd;
+    ngx_http_upstream_t               *u;
 
     if (ngx_http_upstream_create(r) != NGX_OK) {
         ngx_http_simple_auth_verify_finalize(r, NGX_HTTP_BAD_GATEWAY);
@@ -697,23 +707,29 @@ ngx_http_simple_auth_verify_upstream(ngx_http_request_t *r)
     slcf = ngx_http_get_module_loc_conf(r->parent, ngx_http_simple_auth_module);
     u = r->upstream;
 
-    u->conf = ngx_http_get_module_srv_conf(r, ngx_http_upstream_module);
-
-    u->resolved = ngx_pcalloc(r->pool, sizeof(ngx_http_upstream_resolved_t));
-    if (u->resolved == NULL) {
+    if (slcf->upstream_url.naddrs == 0) {
         ngx_http_simple_auth_verify_finalize(r, NGX_HTTP_BAD_GATEWAY);
         ngx_http_finalize_request(r, NGX_HTTP_BAD_GATEWAY);
         return;
     }
 
-    u->resolved->host = slcf->upstream_url.host;
-    u->resolved->port = slcf->upstream_url.port;
-    u->resolved->no_port = slcf->upstream_url.no_port;
-    u->resolved->naddrs = slcf->upstream_url.naddrs;
-    u->resolved->addrs = slcf->upstream_url.addrs;
-    u->resolved->sockaddr = slcf->upstream_url.sockaddr;
-    u->resolved->socklen = slcf->upstream_url.socklen;
-    u->resolved->name = slcf->upstream_url.host;
+    pd = ngx_palloc(r->pool, sizeof(ngx_http_simple_auth_peer_data_t));
+    if (pd == NULL) {
+        ngx_http_simple_auth_verify_finalize(r, NGX_HTTP_BAD_GATEWAY);
+        ngx_http_finalize_request(r, NGX_HTTP_BAD_GATEWAY);
+        return;
+    }
+
+    pd->addr = slcf->upstream_url.addrs;
+
+    u->conf = ngx_http_get_module_srv_conf(r, ngx_http_upstream_module);
+
+    u->peer.data = pd;
+    u->peer.get = ngx_http_simple_auth_verify_get_peer;
+    u->peer.free = ngx_http_simple_auth_verify_free_peer;
+    u->peer.name = &slcf->upstream_url.host;
+    u->peer.log = r->connection->log;
+    u->peer.log_error = NGX_ERROR_ERR;
 
     u->schema = slcf->upstream_schema;
 
@@ -729,9 +745,30 @@ ngx_http_simple_auth_verify_upstream(ngx_http_request_t *r)
     u->input_filter_init = ngx_http_upstream_non_buffered_filter_init;
     u->input_filter = ngx_http_upstream_non_buffered_filter;
     u->input_filter_ctx = r;
-    u->header_only = 1;
 
     ngx_http_upstream_init(r);
+}
+
+
+static ngx_int_t
+ngx_http_simple_auth_verify_get_peer(ngx_peer_connection_t *pc, void *data)
+{
+    ngx_http_simple_auth_peer_data_t  *pd = data;
+
+    pc->sockaddr = pd->addr->sockaddr;
+    pc->socklen = pd->addr->socklen;
+    pc->name = pd->addr->name;
+    pc->cached = 0;
+    pc->connection = NULL;
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_simple_auth_verify_free_peer(ngx_peer_connection_t *pc, void *data,
+    ngx_uint_t state)
+{
 }
 
 
@@ -820,20 +857,33 @@ ngx_http_simple_auth_verify_create_request(ngx_http_request_t *r)
 static ngx_int_t
 ngx_http_simple_auth_verify_process_header(ngx_http_request_t *r)
 {
-    ngx_int_t            rc;
+    ngx_int_t             rc;
+    ngx_http_status_t     status;
     ngx_http_upstream_t  *u;
 
     u = r->upstream;
+
+    if (u->headers_in.status_n == 0) {
+        ngx_memzero(&status, sizeof(ngx_http_status_t));
+        r->state = 0;
+
+        rc = ngx_http_parse_status_line(r, &u->buffer, &status);
+
+        if (rc == NGX_AGAIN) {
+            return NGX_AGAIN;
+        }
+
+        if (rc != NGX_OK) {
+            return NGX_HTTP_UPSTREAM_INVALID_HEADER;
+        }
+
+        u->headers_in.status_n = status.code;
+    }
 
     for ( ;; ) {
         rc = ngx_http_parse_header_line(r, &u->buffer, 1);
 
         if (rc == NGX_OK) {
-            rc = ngx_http_upstream_process_header(r, u);
-            if (rc != NGX_OK) {
-                return rc;
-            }
-
             continue;
         }
 

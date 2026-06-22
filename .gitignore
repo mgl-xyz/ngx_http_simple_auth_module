@@ -4,6 +4,7 @@ objs/
 *.swp
 *.swo
 .DS_Store
+.build/
 nginx.tar.gz
 nginx-*/
 .idea
