@@ -6,3 +6,4 @@ objs/
 .DS_Store
 nginx.tar.gz
 nginx-*/
+.idea
