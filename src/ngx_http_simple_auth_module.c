@@ -14,6 +14,8 @@
 #define NGX_HTTP_SIMPLE_AUTH_BEARER_PREFIX     "Bearer "
 #define NGX_HTTP_SIMPLE_AUTH_BEARER_PREFIX_LEN 7
 
+#define NGX_HTTP_SIMPLE_AUTH_VERIFY_URI          "/__ngx_simple_auth_verify__"
+
 
 typedef struct {
     ngx_flag_t  auth_enable;
@@ -610,7 +612,7 @@ ngx_http_simple_auth_verify_done(ngx_http_request_t *r, void *data,
 {
     ngx_http_simple_auth_ctx_t  *ctx = data;
 
-    if (ctx->status == 0) {
+    if (!ctx->done) {
         if (r->headers_out.status) {
             ctx->status = r->headers_out.status;
         } else {
@@ -630,7 +632,7 @@ ngx_http_simple_auth_start_verify(ngx_http_request_t *r,
     ngx_http_request_t            *sr;
     ngx_http_post_subrequest_t    *ps;
     ngx_table_elt_t               *h;
-    ngx_str_t                      uri;
+    ngx_str_t                      verify_uri;
 
     ps = ngx_palloc(r->pool, sizeof(ngx_http_post_subrequest_t));
     if (ps == NULL) {
@@ -640,14 +642,17 @@ ngx_http_simple_auth_start_verify(ngx_http_request_t *r,
     ps->handler = ngx_http_simple_auth_verify_done;
     ps->data = ctx;
 
-    uri = r->uri;
+    ngx_str_set(&verify_uri, NGX_HTTP_SIMPLE_AUTH_VERIFY_URI);
 
-    if (ngx_http_subrequest(r, &uri, &r->args, &sr, ps,
+    if (ngx_http_subrequest(r, &verify_uri, NULL, &sr, ps,
                             NGX_HTTP_SUBREQUEST_WAITED)
         != NGX_OK)
     {
         return NGX_ERROR;
     }
+
+    sr->content_handler = ngx_http_simple_auth_verify_handler;
+    sr->header_only = 1;
 
     if (r->headers_in.authorization) {
         h = ngx_list_push(&sr->headers_in.headers);
@@ -659,9 +664,6 @@ ngx_http_simple_auth_start_verify(ngx_http_request_t *r,
         h->next = NULL;
         sr->headers_in.authorization = h;
     }
-
-    sr->content_handler = ngx_http_simple_auth_verify_handler;
-    sr->header_only = 1;
 
     ctx->request = r;
     ctx->subrequest = sr;
@@ -775,12 +777,23 @@ ngx_http_simple_auth_verify_free_peer(ngx_peer_connection_t *pc, void *data,
 static void
 ngx_http_simple_auth_verify_abort(ngx_http_request_t *r, ngx_int_t rc)
 {
-    if (rc == NGX_HTTP_CLIENT_CLOSED_REQUEST) {
-        ngx_http_simple_auth_verify_finalize(r, NGX_HTTP_BAD_GATEWAY);
+    ngx_http_request_t         *pr;
+    ngx_http_simple_auth_ctx_t *ctx;
+
+    pr = r->parent;
+    if (pr == NULL) {
         return;
     }
 
-    ngx_http_simple_auth_verify_finalize(r, NGX_HTTP_BAD_GATEWAY);
+    ctx = ngx_http_get_module_ctx(pr, ngx_http_simple_auth_module);
+    if (ctx == NULL || ctx->done) {
+        return;
+    }
+
+    ctx->done = 1;
+    ctx->status = NGX_HTTP_BAD_GATEWAY;
+
+    (void) rc;
 }
 
 
@@ -935,17 +948,12 @@ ngx_http_simple_auth_handler(ngx_http_request_t *r)
             return ngx_http_simple_auth_unauthorized(r);
         }
 
-        if (ctx->status == NGX_HTTP_FORBIDDEN) {
-            return ngx_http_simple_auth_forbidden(r);
+        /* 非 200 一律拒绝，含 404/502 等 */
+        if (ctx->status >= NGX_HTTP_INTERNAL_SERVER_ERROR) {
+            return ngx_http_simple_auth_bad_gateway(r);
         }
 
-        if (ctx->status >= NGX_HTTP_BAD_REQUEST
-            && ctx->status < NGX_HTTP_INTERNAL_SERVER_ERROR)
-        {
-            return ngx_http_simple_auth_forbidden(r);
-        }
-
-        return ngx_http_simple_auth_bad_gateway(r);
+        return ngx_http_simple_auth_forbidden(r);
     }
 
     if (ngx_http_simple_auth_has_bearer(r)) {
