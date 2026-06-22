@@ -1,0 +1,41 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build module against latest nginx
+        id: build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libpcre2-dev zlib1g-dev curl
+
+          ver=$(curl -fsSL https://nginx.org/download/ \
+            | grep -oE 'nginx-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' \
+            | sort -V | tail -1 | sed 's/nginx-//;s/.tar.gz//')
+
+          echo "nginx_version=$ver" >> "$GITHUB_OUTPUT"
+          echo "nginx version: $ver"
+
+          curl -fsSL "https://nginx.org/download/nginx-${ver}.tar.gz" | tar xz
+          cd "nginx-${ver}"
+          ./configure --with-compat --add-dynamic-module="$GITHUB_WORKSPACE"
+          make modules
+          test -f objs/ngx_http_simple_auth_module.so
+
+      - name: Upload module artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ngx_http_simple_auth_module-nginx-${{ steps.build.outputs.nginx_version }}-ubuntu
+          path: nginx-${{ steps.build.outputs.nginx_version }}/objs/ngx_http_simple_auth_module.so
+          if-no-files-found: error

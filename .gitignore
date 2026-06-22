@@ -1,0 +1,8 @@
+objs/
+*.so
+*.o
+*.swp
+*.swo
+.DS_Store
+nginx.tar.gz
+nginx-*/
