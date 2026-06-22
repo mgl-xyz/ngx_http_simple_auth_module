@@ -10,10 +10,23 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build: dynamic
+            configure_args: --with-compat --add-dynamic-module
+            make_target: modules
+            artifact: ngx_http_simple_auth_module.so
+          - build: static
+            configure_args: --add-module
+            make_target: ""
+            artifact: ""
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build module against latest nginx
+      - name: Build module (${{ matrix.build }})
         id: build
         run: |
           sudo apt-get update
@@ -25,15 +38,26 @@ jobs:
             | sort -V | tail -1 | sed 's/nginx-//;s/.tar.gz//')
 
           echo "nginx_version=$ver" >> "$GITHUB_OUTPUT"
-          echo "nginx version: $ver"
+          echo "nginx version: $ver, build: ${{ matrix.build }}"
 
           curl -fsSL "https://nginx.org/download/nginx-${ver}.tar.gz" | tar xz
           cd "nginx-${ver}"
-          ./configure --with-compat --add-dynamic-module="$GITHUB_WORKSPACE"
-          make modules
-          test -f objs/ngx_http_simple_auth_module.so
+          ./configure ${{ matrix.configure_args }}="$GITHUB_WORKSPACE"
+          if [ -n "${{ matrix.make_target }}" ]; then
+            make -j"$(nproc)" "${{ matrix.make_target }}"
+          else
+            make -j"$(nproc)"
+          fi
 
-      - name: Upload module artifact
+          if [ "${{ matrix.build }}" = "dynamic" ]; then
+            test -f "objs/${{ matrix.artifact }}"
+          else
+            test -f objs/nginx
+            nm objs/nginx | grep -q ngx_http_simple_auth_handler
+          fi
+
+      - name: Upload dynamic module artifact
+        if: matrix.build == 'dynamic'
         uses: actions/upload-artifact@v4
         with:
           name: ngx_http_simple_auth_module-nginx-${{ steps.build.outputs.nginx_version }}-ubuntu
