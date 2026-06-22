@@ -757,7 +757,7 @@ ngx_http_simple_auth_verify_get_peer(ngx_peer_connection_t *pc, void *data)
 
     pc->sockaddr = pd->addr->sockaddr;
     pc->socklen = pd->addr->socklen;
-    pc->name = pd->addr->name;
+    pc->name = &pd->addr->name;
     pc->cached = 0;
     pc->connection = NULL;
 
