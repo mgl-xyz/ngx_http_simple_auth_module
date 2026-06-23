@@ -18,12 +18,12 @@
 
 
 typedef struct {
-    ngx_flag_t  auth_enable;
-    ngx_str_t   auth_backend;
-    ngx_str_t   token_param_key;
-    ngx_str_t   upstream_schema;
-    ngx_str_t   auth_uri;
-    ngx_url_t   upstream_url;
+    ngx_flag_t   auth_enable;
+    ngx_str_t    auth_backend;
+    ngx_str_t    token_param_key;
+    ngx_str_t    upstream_schema;
+    ngx_str_t    auth_uri;
+    ngx_url_t    upstream_url;
 } ngx_http_simple_auth_loc_conf_t;
 
 
@@ -59,11 +59,8 @@ static ngx_int_t ngx_http_simple_auth_get_arg(ngx_http_request_t *r,
     ngx_str_t *name, ngx_str_t *value);
 static ngx_int_t ngx_http_simple_auth_set_bearer(ngx_http_request_t *r,
     ngx_str_t *token);
-static ngx_int_t ngx_http_simple_auth_reply(ngx_http_request_t *r,
-    ngx_uint_t status, u_char *body, size_t body_len);
-static ngx_int_t ngx_http_simple_auth_unauthorized(ngx_http_request_t *r);
-static ngx_int_t ngx_http_simple_auth_forbidden(ngx_http_request_t *r);
-static ngx_int_t ngx_http_simple_auth_bad_gateway(ngx_http_request_t *r);
+static ngx_int_t ngx_http_simple_auth_deny(ngx_http_request_t *r,
+    ngx_uint_t status);
 
 static ngx_int_t ngx_http_simple_auth_start_verify(ngx_http_request_t *r,
     ngx_http_simple_auth_ctx_t *ctx);
@@ -505,79 +502,13 @@ ngx_http_simple_auth_set_bearer(ngx_http_request_t *r, ngx_str_t *token)
 
 
 static ngx_int_t
-ngx_http_simple_auth_reply(ngx_http_request_t *r, ngx_uint_t status,
-    u_char *body, size_t body_len)
+ngx_http_simple_auth_deny(ngx_http_request_t *r, ngx_uint_t status)
 {
-    ngx_int_t    rc;
-    ngx_buf_t   *b;
-    ngx_chain_t  out;
-
     if (ngx_http_discard_request_body(r) != NGX_OK) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    r->headers_out.status = status;
-    ngx_str_set(&r->headers_out.content_type, "application/json; charset=utf-8");
-    r->headers_out.content_length_n = body_len;
-
-    rc = ngx_http_send_header(r);
-    if (rc == NGX_ERROR || rc > NGX_OK) {
-        return rc;
-    }
-
-    b = ngx_calloc_buf(r->pool);
-    if (b == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    b->pos = body;
-    b->last = body + body_len;
-    b->memory = 1;
-    b->last_buf = 1;
-
-    out.buf = b;
-    out.next = NULL;
-
-    rc = ngx_http_output_filter(r, &out);
-    if (rc == NGX_ERROR) {
-        return rc;
-    }
-
-    ngx_http_finalize_request(r, status);
     return status;
-}
-
-
-static ngx_int_t
-ngx_http_simple_auth_unauthorized(ngx_http_request_t *r)
-{
-    static u_char body[] =
-        "{\"code\":401,\"msg\":\"缺少访问凭证，需携带Authorization请求头或url token参数\"}";
-
-    return ngx_http_simple_auth_reply(r, NGX_HTTP_UNAUTHORIZED, body,
-                                      sizeof(body) - 1);
-}
-
-
-static ngx_int_t
-ngx_http_simple_auth_forbidden(ngx_http_request_t *r)
-{
-    static u_char body[] =
-        "{\"code\":403,\"msg\":\"鉴权未通过，拒绝访问\"}";
-
-    return ngx_http_simple_auth_reply(r, NGX_HTTP_FORBIDDEN, body,
-                                      sizeof(body) - 1);
-}
-
-
-static ngx_int_t
-ngx_http_simple_auth_bad_gateway(ngx_http_request_t *r)
-{
-    static u_char body[] =
-        "{\"code\":502,\"msg\":\"鉴权服务不可用，拒绝访问\"}";
-
-    return ngx_http_simple_auth_reply(r, NGX_HTTP_BAD_GATEWAY, body,
-                                      sizeof(body) - 1);
 }
 
 
@@ -944,16 +875,7 @@ ngx_http_simple_auth_handler(ngx_http_request_t *r)
             return NGX_DECLINED;
         }
 
-        if (ctx->status == NGX_HTTP_UNAUTHORIZED) {
-            return ngx_http_simple_auth_unauthorized(r);
-        }
-
-        /* 非 200 一律拒绝，含 404/502 等 */
-        if (ctx->status >= NGX_HTTP_INTERNAL_SERVER_ERROR) {
-            return ngx_http_simple_auth_bad_gateway(r);
-        }
-
-        return ngx_http_simple_auth_forbidden(r);
+        return ngx_http_simple_auth_deny(r, ctx->status);
     }
 
     if (ngx_http_simple_auth_has_bearer(r)) {
@@ -967,7 +889,7 @@ ngx_http_simple_auth_handler(ngx_http_request_t *r)
         } else if (rc == NGX_ERROR) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         } else {
-            return ngx_http_simple_auth_unauthorized(r);
+            return ngx_http_simple_auth_deny(r, NGX_HTTP_UNAUTHORIZED);
         }
     }
 
@@ -979,7 +901,7 @@ ngx_http_simple_auth_handler(ngx_http_request_t *r)
     ngx_http_set_ctx(r, ctx, ngx_http_simple_auth_module);
 
     if (ngx_http_simple_auth_start_verify(r, ctx) != NGX_OK) {
-        return ngx_http_simple_auth_bad_gateway(r);
+        return ngx_http_simple_auth_deny(r, NGX_HTTP_BAD_GATEWAY);
     }
 
     return NGX_AGAIN;
