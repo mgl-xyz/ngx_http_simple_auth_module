@@ -1,12 +1,12 @@
 # ngx_http_simple_auth_module
 
-Nginx 原生 C 动态模块：对象存储网关层凭证标准化与鉴权网关。将 URL Query 中的 token 自动转为 `Authorization: Bearer` 请求头，并向 `auth_backend` 发起鉴权；**仅鉴权接口返回 HTTP 200 时**才继续执行 location 内后续配置。
+Nginx 原生 C 模块（支持动态加载与静态编译）：对象存储网关层凭证标准化与鉴权网关。将 URL Query 中的 token 自动转为 `Authorization: Bearer` 请求头，并向 `auth_backend` 发起鉴权；**仅鉴权接口返回 HTTP 200 时**才继续执行 location 内后续配置。
 
 English documentation: [README.en.md](README.en.md)
 
 ## 特性
 
-- 纯 C 原生 Nginx 动态模块，不依赖 OpenResty / Lua / JWT 库
+- 纯 C 原生 Nginx 模块，支持 `--add-module` 静态编译与 `--add-dynamic-module` 动态加载
 - 双通道凭证：Header 优先，URL 参数兜底
 - 向 `auth_backend` 鉴权，**只认 HTTP 200**
 - 鉴权失败时返回 HTTP 状态码，错误页用 Nginx 原生 `error_page` 统一配置
@@ -14,9 +14,14 @@ English documentation: [README.en.md](README.en.md)
 
 ## 编译
 
+### 动态模块（推荐）
+
+模块编译为 `.so`，通过 `load_module` 加载，升级 Nginx 主程序时通常无需重编模块。
+
 ```bash
 cd /path/to/nginx-1.30.x
-./configure --with-compat --add-dynamic-module=/path/to/ngx_http_simple_auth_module
+./configure --with-compat \
+    --add-dynamic-module=/path/to/ngx_http_simple_auth_module
 make && make install
 ```
 
@@ -25,6 +30,32 @@ make && make install
 ```nginx
 load_module modules/ngx_http_simple_auth_module.so;
 ```
+
+本仓库 Makefile：
+
+```bash
+make NGINX_SRC=/path/to/nginx-1.30.x
+make install NGINX_SRC=/path/to/nginx-1.30.x NGINX_PREFIX=/usr/local/nginx
+```
+
+### 静态模块
+
+模块直接编进 `nginx` 二进制，**不需要** `load_module`。
+
+```bash
+cd /path/to/nginx-1.30.x
+./configure --add-module=/path/to/ngx_http_simple_auth_module
+make && make install
+```
+
+本仓库 Makefile：
+
+```bash
+make static NGINX_SRC=/path/to/nginx-1.30.x
+make -C /path/to/nginx-1.30.x install NGINX_PREFIX=/usr/local/nginx
+```
+
+静态编译时 `nginx.conf` 里不要写 `load_module`。
 
 ## 配置示例
 

@@ -1,12 +1,12 @@
 # ngx_http_simple_auth_module
 
-Native Nginx C dynamic module: credential normalization and auth gateway for object storage proxies. Converts URL `token` query parameters to `Authorization: Bearer` headers and verifies them against `auth_backend`. **Only HTTP 200 from the auth backend** allows the request to proceed to `root`, `proxy_pass`, etc.
+Native Nginx C module (static or dynamic): credential normalization and auth gateway for object storage proxies. Converts URL `token` query parameters to `Authorization: Bearer` headers and verifies them against `auth_backend`. **Only HTTP 200 from the auth backend** allows the request to proceed to `root`, `proxy_pass`, etc.
 
 中文文档：[README.md](README.md)
 
 ## Features
 
-- Pure C Nginx module (no OpenResty / Lua / JWT libraries)
+- Pure C Nginx module; supports `--add-module` (static) and `--add-dynamic-module` (dynamic)
 - Dual credential channels: Header first, URL parameter fallback
 - Auth check against `auth_backend`; **only HTTP 200 passes**
 - On failure, returns HTTP status codes; use Nginx `error_page` for unified error pages
@@ -14,9 +14,14 @@ Native Nginx C dynamic module: credential normalization and auth gateway for obj
 
 ## Build
 
+### Dynamic module (recommended)
+
+Builds a `.so` loaded via `load_module`. Often no module rebuild when upgrading the nginx binary.
+
 ```bash
 cd /path/to/nginx-1.30.x
-./configure --with-compat --add-dynamic-module=/path/to/ngx_http_simple_auth_module
+./configure --with-compat \
+    --add-dynamic-module=/path/to/ngx_http_simple_auth_module
 make && make install
 ```
 
@@ -25,6 +30,32 @@ In `nginx.conf`:
 ```nginx
 load_module modules/ngx_http_simple_auth_module.so;
 ```
+
+This repo's Makefile:
+
+```bash
+make NGINX_SRC=/path/to/nginx-1.30.x
+make install NGINX_SRC=/path/to/nginx-1.30.x NGINX_PREFIX=/usr/local/nginx
+```
+
+### Static module
+
+Module is linked into the `nginx` binary. **No** `load_module` directive.
+
+```bash
+cd /path/to/nginx-1.30.x
+./configure --add-module=/path/to/ngx_http_simple_auth_module
+make && make install
+```
+
+This repo's Makefile:
+
+```bash
+make static NGINX_SRC=/path/to/nginx-1.30.x
+make -C /path/to/nginx-1.30.x install NGINX_PREFIX=/usr/local/nginx
+```
+
+Do not use `load_module` in `nginx.conf` when built statically.
 
 ## Example
 
