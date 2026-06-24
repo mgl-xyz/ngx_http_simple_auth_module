@@ -161,6 +161,7 @@ ngx_http_simple_auth_create_loc_conf(ngx_conf_t *cf)
     conf->upstream.max_temp_file_size = 0;
     conf->upstream.temp_file_write_size = 0;
     conf->upstream.intercept_errors = 0;
+    conf->upstream.ignore_client_abort = 1;
     conf->upstream.pass_request_headers = 0;
     conf->upstream.pass_request_body = 0;
 
@@ -183,8 +184,8 @@ ngx_http_simple_auth_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_str_value(conf->auth_host_header, prev->auth_host_header, "");
     ngx_conf_merge_msec_value(conf->cache_valid, prev->cache_valid, 0);
 
-    ngx_conf_merge_ptr_value(conf->upstream.local,
-                             prev->upstream.local, NULL);
+    ngx_conf_merge_value(conf->upstream.ignore_client_abort,
+                         prev->upstream.ignore_client_abort, 1);
     ngx_conf_merge_value(conf->upstream.socket_keepalive,
                          prev->upstream.socket_keepalive, 0);
     ngx_conf_merge_uint_value(conf->upstream.next_upstream_tries,

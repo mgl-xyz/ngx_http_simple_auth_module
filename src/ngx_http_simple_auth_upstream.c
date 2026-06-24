@@ -10,7 +10,7 @@
 
 static ngx_int_t ngx_http_simple_auth_verify_handler(ngx_http_request_t *r);
 static void ngx_http_simple_auth_verify_input_body(ngx_http_request_t *r);
-static void ngx_http_simple_auth_verify_abort(ngx_http_request_t *r,
+static void ngx_http_simple_auth_verify_finalize_request(ngx_http_request_t *r,
     ngx_int_t rc);
 static ngx_int_t ngx_http_simple_auth_verify_create_request(ngx_http_request_t *r);
 static ngx_int_t ngx_http_simple_auth_verify_process_header(ngx_http_request_t *r);
@@ -154,7 +154,11 @@ ngx_http_simple_auth_verify_upstream(ngx_http_request_t *r)
         return;
     }
 
-    slcf = ngx_http_get_module_loc_conf(r->parent, ngx_http_simple_auth_module);
+    slcf = ngx_http_get_module_loc_conf(r, ngx_http_simple_auth_module);
+    if (slcf->upstream.upstream == NULL && r->parent != NULL) {
+        slcf = ngx_http_get_module_loc_conf(r->parent,
+                                            ngx_http_simple_auth_module);
+    }
     u = r->upstream;
 
     if (slcf->upstream.upstream == NULL) {
@@ -174,7 +178,7 @@ ngx_http_simple_auth_verify_upstream(ngx_http_request_t *r)
 
     u->create_request = ngx_http_simple_auth_verify_create_request;
     u->process_header = ngx_http_simple_auth_verify_process_header;
-    u->finalize_request = ngx_http_simple_auth_verify_abort;
+    u->finalize_request = ngx_http_simple_auth_verify_finalize_request;
     u->input_filter_init = ngx_http_upstream_non_buffered_filter_init;
     u->input_filter = ngx_http_upstream_non_buffered_filter;
     u->input_filter_ctx = r;
@@ -184,7 +188,7 @@ ngx_http_simple_auth_verify_upstream(ngx_http_request_t *r)
 
 
 static void
-ngx_http_simple_auth_verify_abort(ngx_http_request_t *r, ngx_int_t rc)
+ngx_http_simple_auth_verify_finalize_request(ngx_http_request_t *r, ngx_int_t rc)
 {
     ngx_http_request_t         *pr;
     ngx_http_simple_auth_ctx_t *ctx;
@@ -195,14 +199,23 @@ ngx_http_simple_auth_verify_abort(ngx_http_request_t *r, ngx_int_t rc)
     }
 
     ctx = ngx_http_get_module_ctx(pr, ngx_http_simple_auth_module);
-    if (ctx == NULL || ctx->done) {
+    if (ctx == NULL) {
         return;
     }
 
-    ctx->done = 1;
-    ctx->status = NGX_HTTP_BAD_GATEWAY;
+    if (!ctx->done) {
+        if (rc == NGX_OK || rc == NGX_HTTP_OK) {
+            ctx->status = r->upstream->headers_in.status_n;
+            if (ctx->status == 0) {
+                ctx->status = NGX_HTTP_BAD_GATEWAY;
+            }
+        } else {
+            ctx->status = NGX_HTTP_BAD_GATEWAY;
+        }
 
-    (void) rc;
+        ctx->done = 1;
+        r->headers_out.status = ctx->status;
+    }
 }
 
 
@@ -220,11 +233,19 @@ ngx_http_simple_auth_verify_create_request(ngx_http_request_t *r)
     slcf = ngx_http_get_module_loc_conf(pr, ngx_http_simple_auth_module);
     u = r->upstream;
 
-    len = sizeof("GET ") - 1 + slcf->auth_uri.len
-          + sizeof(" HTTP/1.1\r\n") - 1
-          + sizeof("Host: \r\n") - 1 + slcf->auth_host_header.len
-          + sizeof("X-Original-URI: \r\n") - 1 + pr->uri.len
-          + sizeof("\r\n\r\n") - 1;
+    if (pr->unparsed_uri.len) {
+        len = sizeof("GET ") - 1 + slcf->auth_uri.len
+              + sizeof(" HTTP/1.1\r\n") - 1
+              + sizeof("Host: \r\n") - 1 + slcf->auth_host_header.len
+              + sizeof("X-Original-URI: \r\n") - 1 + pr->unparsed_uri.len
+              + sizeof("\r\n\r\n") - 1;
+    } else {
+        len = sizeof("GET ") - 1 + slcf->auth_uri.len
+              + sizeof(" HTTP/1.1\r\n") - 1
+              + sizeof("Host: \r\n") - 1 + slcf->auth_host_header.len
+              + sizeof("X-Original-URI: \r\n") - 1 + pr->uri.len
+              + sizeof("\r\n\r\n") - 1;
+    }
 
     if (pr->headers_in.authorization) {
         len += sizeof("Authorization: \r\n") - 1
@@ -264,7 +285,11 @@ ngx_http_simple_auth_verify_create_request(ngx_http_request_t *r)
 
     b->last = ngx_cpymem(b->last, (u_char *) "X-Original-URI: ",
                          sizeof("X-Original-URI: ") - 1);
-    b->last = ngx_copy(b->last, pr->uri.data, pr->uri.len);
+    if (pr->unparsed_uri.len) {
+        b->last = ngx_copy(b->last, pr->unparsed_uri.data, pr->unparsed_uri.len);
+    } else {
+        b->last = ngx_copy(b->last, pr->uri.data, pr->uri.len);
+    }
     *b->last++ = '\r'; *b->last++ = '\n';
 
     b->last = ngx_cpymem(b->last, (u_char *) "\r\n\r\n",
@@ -367,6 +392,7 @@ ngx_http_simple_auth_verify_process_header(ngx_http_request_t *r)
                 u->keepalive = 0;
             }
 
+            r->headers_out.status = u->headers_in.status_n;
             ngx_http_simple_auth_verify_finalize(r, u->headers_in.status_n);
             return NGX_OK;
         }
