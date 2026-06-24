@@ -85,7 +85,6 @@ ngx_http_simple_auth_start_verify(ngx_http_request_t *r,
 {
     ngx_http_request_t            *sr;
     ngx_http_post_subrequest_t    *ps;
-    ngx_table_elt_t               *h;
     ngx_str_t                      verify_uri;
 
     ps = ngx_palloc(r->pool, sizeof(ngx_http_post_subrequest_t));
@@ -105,19 +104,17 @@ ngx_http_simple_auth_start_verify(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
+    /*
+     * Fake request body: avoid ngx_http_read_client_request_body() touching
+     * a NULL request_body on the subrequest (see ngx_http_auth_request_module).
+     */
+    sr->request_body = ngx_pcalloc(r->pool, sizeof(ngx_http_request_body_t));
+    if (sr->request_body == NULL) {
+        return NGX_ERROR;
+    }
+
     sr->content_handler = ngx_http_simple_auth_verify_handler;
     sr->header_only = 1;
-
-    if (r->headers_in.authorization) {
-        h = ngx_list_push(&sr->headers_in.headers);
-        if (h == NULL) {
-            return NGX_ERROR;
-        }
-
-        *h = *r->headers_in.authorization;
-        h->next = NULL;
-        sr->headers_in.authorization = h;
-    }
 
     ctx->request = r;
     ctx->subrequest = sr;
@@ -134,13 +131,12 @@ ngx_http_simple_auth_verify_done(ngx_http_request_t *r, void *data,
     ngx_http_simple_auth_loc_conf_t  *slcf;
     ngx_str_t                         token;
 
-    if (!ctx->done) {
-        if (r->headers_out.status) {
-            ctx->status = r->headers_out.status;
-        } else {
-            ctx->status = NGX_HTTP_BAD_GATEWAY;
-        }
-        ctx->done = 1;
+    ctx->done = 1;
+
+    if (r->headers_out.status) {
+        ctx->status = r->headers_out.status;
+    } else if (!ctx->status) {
+        ctx->status = NGX_HTTP_BAD_GATEWAY;
     }
 
     if (ctx->request != NULL
@@ -160,11 +156,10 @@ ngx_http_simple_auth_verify_done(ngx_http_request_t *r, void *data,
 static ngx_int_t
 ngx_http_simple_auth_verify_handler(ngx_http_request_t *r)
 {
-    ngx_int_t  rc;
-
-    rc = ngx_http_read_client_request_body(r, ngx_http_simple_auth_verify_input_body);
-    if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
-        return rc;
+    if (ngx_http_read_client_request_body(r, ngx_http_simple_auth_verify_input_body)
+        != NGX_OK)
+    {
+        return NGX_DONE;
     }
 
     return NGX_DONE;
@@ -240,11 +235,11 @@ ngx_http_simple_auth_verify_finalize_request(ngx_http_request_t *r, ngx_int_t rc
     }
 
     if (!ctx->done) {
-        if (rc == NGX_OK || rc == NGX_HTTP_OK) {
+        if ((rc == NGX_OK || rc == NGX_HTTP_OK)
+            && r->upstream != NULL
+            && r->upstream->headers_in.status_n != 0)
+        {
             ctx->status = r->upstream->headers_in.status_n;
-            if (ctx->status == 0) {
-                ctx->status = NGX_HTTP_BAD_GATEWAY;
-            }
         } else {
             ctx->status = NGX_HTTP_BAD_GATEWAY;
         }
@@ -266,7 +261,15 @@ ngx_http_simple_auth_verify_create_request(ngx_http_request_t *r)
     ngx_http_upstream_t              *u;
 
     pr = r->parent;
+    if (pr == NULL) {
+        return NGX_ERROR;
+    }
+
     slcf = ngx_http_get_module_loc_conf(pr, ngx_http_simple_auth_module);
+    if (slcf->upstream.upstream == NULL) {
+        slcf = ngx_http_get_module_loc_conf(r, ngx_http_simple_auth_module);
+    }
+
     u = r->upstream;
 
     if (pr->unparsed_uri.len) {

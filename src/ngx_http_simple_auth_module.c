@@ -635,8 +635,10 @@ ngx_http_simple_auth_handler(ngx_http_request_t *r)
             return NGX_AGAIN;
         }
 
-        if (ctx->status == NGX_HTTP_OK) {
-            return NGX_DECLINED;
+        if (ctx->status >= NGX_HTTP_OK
+            && ctx->status < NGX_HTTP_SPECIAL_RESPONSE)
+        {
+            return NGX_OK;
         }
 
         return ngx_http_simple_auth_deny(r, ctx->status);
