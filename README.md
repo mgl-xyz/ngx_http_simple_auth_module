@@ -97,7 +97,9 @@ server {
 | 指令 | 默认值 | 说明 |
 |------|--------|------|
 | `auth_enable on \| off` | `off` | 启用鉴权；配置 `auth_backend` 时自动视为 `on` |
-| `auth_backend <URL>` | — | 鉴权接口地址，如 `http://127.0.0.1:8080/auth/check` |
+| `auth_backend <URL>` | — | 鉴权接口地址；支持 `http(s)://host/path` 或 `http(s)://upstream名/path`（语法同 `proxy_pass`） |
+
+连接复用：在 `upstream` 块中配置 `keepalive N`，模块会以 HTTP/1.1 复用鉴权连接（与 `proxy_pass` 相同用法）。
 | `token_param_key <name>` | `token` | URL Query 凭证参数名 |
 
 ## 鉴权流程

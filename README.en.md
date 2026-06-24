@@ -97,7 +97,9 @@ The module only returns status codes. You do **not** need per-location error pag
 | Directive | Default | Description |
 |-----------|---------|-------------|
 | `auth_enable on \| off` | `off` | Enable auth; auto-on when `auth_backend` is set |
-| `auth_backend <URL>` | — | Auth endpoint, e.g. `http://127.0.0.1:8080/auth/check` |
+| `auth_backend <URL>` | — | Auth endpoint; `http(s)://host/path` or `http(s)://upstream_name/path` (same as `proxy_pass`) |
+
+Connection reuse: set `keepalive N` in the `upstream` block; the module uses HTTP/1.1 keepalive to the auth backend (same as `proxy_pass`).
 | `token_param_key <name>` | `token` | URL query parameter name for token |
 
 ## Auth flow
