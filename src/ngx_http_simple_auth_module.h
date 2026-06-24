@@ -61,6 +61,7 @@ ngx_int_t ngx_http_simple_auth_start_verify(ngx_http_request_t *r,
     ngx_http_simple_auth_ctx_t *ctx);
 
 /* ngx_http_simple_auth_upstream.c */
+ngx_int_t ngx_http_simple_auth_rewrite_init(ngx_conf_t *cf);
 void ngx_http_simple_auth_verify_upstream(ngx_http_request_t *r);
 ngx_int_t ngx_http_simple_auth_verify_finalize(ngx_http_request_t *r,
     ngx_uint_t status);

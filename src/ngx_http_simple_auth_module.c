@@ -126,6 +126,10 @@ ngx_http_simple_auth_init(ngx_conf_t *cf)
 
     *h = ngx_http_simple_auth_handler;
 
+    if (ngx_http_simple_auth_rewrite_init(cf) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
     return NGX_OK;
 }
 
